@@ -1,0 +1,6 @@
+{
+  "scope": "x_502054_maa",
+  "scopeId": "4a5a6115402946939ee48e3fe80f60f8",
+  "name": "My Awesome App",
+  "tsconfigPath": "./src/server/tsconfig.json"
+}
