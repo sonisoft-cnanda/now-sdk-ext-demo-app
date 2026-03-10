@@ -23,7 +23,9 @@ export const changeRequestTaskCreatorFlow = Flow(
     (params) => {
         wfa.action(
             action.core.createRecord,
-            { $id: Now.ID['create_change_task'] },
+            {
+                $id: Now.ID['create_change_task'],
+            },
             {
                 table_name: 'change_task',
                 values: TemplateValue({

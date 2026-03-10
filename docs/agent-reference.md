@@ -87,7 +87,12 @@ npm run types      # Regenerate script include type definitions from instance
 **After any new `.now.ts` file is created:**
 1. Run `npm run build` — the SDK will assign stable sys_ids and update `keys.ts`
 2. Run `npm run deploy` — pushes to instance
-3. Use MCP tools to verify and (for Flows) publish
+3. Use MCP tools to verify; for Flows use `test_flow` → `get_flow_execution_details` to iterate
+
+**Flow development loop:**
+```
+edit .now.ts → npm run build → npm run deploy → test_flow → get_flow_execution_details → repeat
+```
 
 ---
 
@@ -446,7 +451,7 @@ mcp__servicenow__query_table
 
 ### Publish a Flow after deployment
 
-Flows deploy in an **unpublished (draft) state** — they cannot be executed until published. Use this script:
+Flows deploy in an **unpublished (draft) state**. Publishing is required before `execute_flow` can run them, but **not** before `test_flow` (see below). To publish:
 
 ```
 mcp__servicenow__execute_script
@@ -457,37 +462,126 @@ mcp__servicenow__execute_script
 
 Look for `"isPublished":true` in the output.
 
-### Execute a Flow for testing
+**Tracking:** Issue open to add a dedicated `publish_flow` MCP tool — [sonisoft-cnanda/now-sdk-ext-mcp#24](https://github.com/sonisoft-cnanda/now-sdk-ext-mcp/issues/24)
 
-Record-triggered flows require a **GlideRecord object** — not a raw sys_id string — as the `current` input. Use a background script to execute:
+---
+
+### Testing Flows — the correct workflow
+
+**Always use `test_flow` when iterating on a flow.** It works on draft/unpublished flows, accepts a plain record sys_id, and is equivalent to clicking "Test" in Flow Designer. There is no need to publish first, and no need to wrap inputs in a GlideRecord.
+
+#### Step 1 — Run the test
+```
+mcp__servicenow__test_flow
+  flow_id: <flow_sys_id or scoped_name>
+  output_map: { "current": "<record_sys_id>", "table_name": "<table>" }
+```
+
+`test_flow` runs synchronously and returns a `context_id` immediately.
+
+For record-triggered flows the standard inputs are `current` (the triggering record's sys_id) and `table_name`. Check the flow's trigger definition in the FDL file to confirm variable names if they differ.
+
+#### Step 2 — Inspect execution details (primary diagnostic tool)
+```
+mcp__servicenow__get_flow_execution_details
+  context_id: <context_id>
+```
+
+This is the richest tool — it returns per-action results including:
+- State (`COMPLETE`, `ERROR`, `NOT_READY`, `WAITING`)
+- Timing per action
+- Exact inputs and outputs for each step
+- Whether the run was a test or production execution
+
+Use this first after any test run to see what each action did, what values were passed, and which branch was taken.
+
+#### Step 3 — Handle specific outcomes
+
+**Flow is WAITING:** Normal for flows that use `wait: true` on task actions (e.g. `createTask` with `wait: true` pauses until the task is closed). The task was still created — verify it with `query_table`.
+
+**Flow errored:** Check the error:
+```
+mcp__servicenow__get_flow_error
+  context_id: <context_id>
+```
+
+**Need structured outputs:** If the flow defines output variables:
+```
+mcp__servicenow__get_flow_outputs
+  context_id: <context_id>
+```
+
+**Need log entries:** For flows that use `action.core.log` steps, or for error/warning detail:
+```
+mcp__servicenow__get_flow_logs
+  context_id: <context_id>
+```
+Note: logs may be empty for simple successful executions if the flow's reporting level is `NONE`. Errors and warnings are always logged regardless.
+
+**Poll status for long-running background flows:**
+```
+mcp__servicenow__get_flow_context_status
+  context_id: <context_id>
+```
+States: `QUEUED` → `IN_PROGRESS` → `WAITING` → `COMPLETE` / `ERROR` / `CANCELLED`
+
+#### Full iteration loop
+```
+edit flow FDL → npm run build → npm run deploy
+  → test_flow
+  → get_flow_execution_details   (diagnose each step)
+  → get_flow_error               (if state = ERROR)
+  → fix → repeat
+```
+
+#### When to use `execute_flow` vs `test_flow`
+
+| | `test_flow` | `execute_flow` |
+|---|---|---|
+| Requires published flow | No | Yes |
+| Input format for `current` | Plain sys_id string | GlideRecord object (use `execute_script` workaround) |
+| Use case | Development, iteration, verification | Production-equivalent execution of published flows |
+| Equivalent to | Flow Designer "Test" button | Calling `sn_fd.FlowAPI.startFlow()` |
+
+**During development, always use `test_flow`.** Only switch to `execute_flow` for production-equivalent testing of a fully published flow.
+
+If you need to execute a published flow and pass a record input, use `execute_script` to call `sn_fd.FlowAPI.startFlow()` directly and wrap the record in a GlideRecord:
 
 ```
 mcp__servicenow__execute_script
   script: |
     var current = new GlideRecord('<table_name>');
     current.get('<record_sys_id>');
-    var inputs = { current: current };
     var contextId = sn_fd.FlowAPI.startFlow(
         '<scope>.<flow_internal_name>',
-        inputs,
+        { current: current },
         'background'
     );
     gs.print('Context ID: ' + contextId);
 ```
 
-Then poll for completion:
+**Tracking:** Issue open to fix GlideRecord wrapping in `execute_flow` — [sonisoft-cnanda/now-sdk-ext-mcp#25](https://github.com/sonisoft-cnanda/now-sdk-ext-mcp/issues/25)
+
+---
+
+### Copy and pull an existing OOB flow
+
+To modify an out-of-box flow without touching the original:
+
 ```
-mcp__servicenow__get_flow_context_status
-  context_id: <context_id_from_above>
+# 1. Copy into your scope
+mcp__servicenow__copy_flow
+  source_flow_id: <original_flow_sys_id or scoped_name>
+  name: <display name for the copy>
+  target_scope: <your app scope sys_id>
+
+# 2. Pull the copy into your local project
+npm run transform -- --flow <new_flow_sys_id>
 ```
 
-States: `QUEUED` → `IN_PROGRESS` → `COMPLETE` / `ERROR`
+The transform generates files under `src/fluent/generated/automation/flow/`. These use the low-level `Record()` API when the flow contains custom actions or unsupported constructs — this is expected and still deployable. Edit the generated files directly, then build and deploy as normal.
 
-If `ERROR`:
-```
-mcp__servicenow__get_flow_error
-  context_id: <context_id>
-```
+**Note:** `now-sdk transform` only generates `'GUID'` as a dataPill type for some fields — this is a known SDK issue. Replace `'GUID'` with `'reference'` if the build fails with a type error on `wfa.dataPill(..., 'GUID')`.
 
 ### Run a server-side smoke test
 ```
@@ -513,7 +607,9 @@ mcp__servicenow__list_update_sets
 | Table/record queries | `query_table`, `count_records`, `discover_table_schema`, `lookup_table`, `lookup_columns` |
 | Script execution | `execute_script` |
 | Update sets | `list_update_sets`, `inspect_update_set`, `get_current_update_set` |
-| Flow management | `execute_flow`, `execute_subflow`, `execute_action`, `get_flow_context_status`, `get_flow_error`, `get_flow_outputs` |
+| **Flow testing (primary)** | **`test_flow`**, `get_flow_execution_details`, `get_flow_error`, `get_flow_outputs`, `get_flow_logs`, `get_flow_context_status` |
+| Flow execution (published) | `execute_flow`, `execute_subflow`, `execute_action` |
+| Flow management | `copy_flow` |
 | App management | `get_app_details`, `list_scoped_apps` |
 | Code search | `code_search` |
 | ATF testing | `find_atf_tests`, `run_atf_test`, `run_atf_test_suite` |
@@ -522,35 +618,42 @@ mcp__servicenow__list_update_sets
 
 ## Known Gotchas & Workarounds
 
-### 1. Flows deploy as unpublished/draft
+### 1. Use `test_flow`, not `execute_flow`, when iterating on flows
+`test_flow` works on unpublished drafts, accepts a plain sys_id string for `current`, and gives full per-step execution details via `get_flow_execution_details`. `execute_flow` requires the flow to be published and needs a GlideRecord object — use it only for production-equivalent testing.
+
+### 2. Flows deploy as unpublished/draft
 **Symptom:** `execute_flow` returns `"has not been published within application scope"`
-**Fix:** After every deploy, publish the flow:
+**Fix:** Publish via script after deploy:
 ```javascript
 sn_fd.FlowAPI.publish('<flow_sys_id>');
 ```
-The sys_id is in `src/fluent/generated/keys.ts` after the build.
+Or just use `test_flow` instead — it doesn't require publishing.
 
 **Tracking:** Issue open to add a `publish_flow` MCP tool — [sonisoft-cnanda/now-sdk-ext-mcp#24](https://github.com/sonisoft-cnanda/now-sdk-ext-mcp/issues/24)
 
-### 2. execute_flow MCP tool requires GlideRecord, not sys_id string
+### 3. `execute_flow` requires a GlideRecord, not a sys_id string
 **Symptom:** `execute_flow` with `inputs: { current: "<sys_id>" }` returns `"Invalid GlideRecord input format found"`
-**Fix:** Use `execute_script` to call `sn_fd.FlowAPI.startFlow()` directly, wrapping the record in a `GlideRecord` object (see example above).
+**Fix:** Use `test_flow` instead. If you must use `execute_flow`, call `sn_fd.FlowAPI.startFlow()` via `execute_script` and wrap the record manually in a GlideRecord.
 
 **Tracking:** Issue open to fix input wrapping in MCP — [sonisoft-cnanda/now-sdk-ext-mcp#25](https://github.com/sonisoft-cnanda/now-sdk-ext-mcp/issues/25)
 
-### 3. `npm run types` is slow (~2-3 min) and unrelated to keys.ts
+### 4. `now-sdk transform` may generate `'GUID'` as a dataPill type, which is invalid
+**Symptom:** Build fails with `Argument of type '"GUID"' is not assignable to parameter of type 'FlowDataType'`
+**Fix:** Replace `'GUID'` with `'reference'` in the generated file. This is a known SDK issue with the transform output for certain field types.
+
+### 5. `npm run types` is slow (~2-3 min) and unrelated to keys.ts
 `npm run build` regenerates `keys.ts` automatically. `npm run types` fetches Script Include type definitions from the instance — only needed when writing server-side code that calls existing Script Includes. Don't block a build on it.
 
-### 4. `src/fluent/generated/keys.ts` must exist before TypeScript will compile
+### 6. `src/fluent/generated/keys.ts` must exist before TypeScript will compile
 If this file is missing (e.g. fresh clone), run `npm run build` once. It is gitignored intentionally — never commit it.
 
-### 5. Every FDL step needs a unique `$id`
+### 7. Every FDL step needs a unique `$id`
 Every `wfa.action(...)`, `wfa.trigger(...)`, `wfa.flowLogic.if(...)`, etc. must have a `{ $id: Now.ID['unique_key'] }` as its second argument. Duplicate keys across the same flow will cause a build error.
 
-### 6. `@servicenow/sdk/global` must be imported in every `.now.ts` file
+### 8. `@servicenow/sdk/global` must be imported in every `.now.ts` file
 This import makes `Now.ID`, `TemplateValue`, and `Duration` available as globals. Without it, TypeScript will not recognize these symbols.
 
-### 7. `TemplateValue` and `Duration` are globals, not imports
+### 9. `TemplateValue` and `Duration` are globals, not imports
 Do **not** import these from anywhere. They are injected by `@servicenow/sdk/global`.
 ```typescript
 // Correct:
@@ -561,7 +664,7 @@ timeout_duration: Duration({ days: 7 })
 import { TemplateValue } from '@servicenow/sdk/core'  // ← does not exist
 ```
 
-### 8. Flow condition field accepts encoded ServiceNow query strings
+### 10. Flow condition field accepts encoded ServiceNow query strings
 The `condition` field in a trigger uses ServiceNow's encoded query format:
 ```typescript
 condition: 'active=true^priority=1'
@@ -569,7 +672,7 @@ condition: 'state=1^ORstate=2'
 condition: ''   // no filter — triggers on every record
 ```
 
-### 9. `change_task` records must set `change_request` to link to the parent
+### 11. `change_task` records must set `change_request` to link to the parent
 When creating change tasks in a flow, always set the `change_request` reference field. Without it the task is created orphaned and won't appear under the change.
 
 ---

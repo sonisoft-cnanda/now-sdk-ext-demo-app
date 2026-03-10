@@ -6,3 +6,4 @@ target/
 *.tsbuildinfo
 .jest_cache
 logs/
+.mcp.json
